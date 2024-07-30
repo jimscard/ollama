@@ -6,18 +6,9 @@ function amdGPUs {
     if ($env:AMDGPU_TARGETS) {
         return $env:AMDGPU_TARGETS
     }
-    # TODO - load from some common data file for linux + windows build consistency
+    # Current supported rocblas list from ROCm v6.1.2 on windows
+    # https://rocm.docs.amd.com/projects/install-on-windows/en/latest/reference/system-requirements.html#windows-supported-gpus
     $GPU_LIST = @(
-        "gfx900"
-        "gfx906:xnack-"
-        "gfx908:xnack-"
-        "gfx90a:xnack+"
-        "gfx90a:xnack-"
-        "gfx940"
-        "gfx941"
-        "gfx942"
-        "gfx1010"
-        "gfx1012"
         "gfx1030"
         "gfx1100"
         "gfx1101"
@@ -39,7 +30,8 @@ function init_vars {
     }
     $script:cmakeDefs = @(
         "-DBUILD_SHARED_LIBS=on",
-        "-DLLAMA_NATIVE=off"
+        "-DGGML_NATIVE=off",
+        "-DGGML_OPENMP=off"
         )
     $script:commonCpuDefs = @("-DCMAKE_POSITION_INDEPENDENT_CODE=on")
     $script:ARCH = $Env:PROCESSOR_ARCHITECTURE.ToLower()
@@ -122,8 +114,13 @@ function build {
     & cmake --version
     & cmake -S "${script:llamacppDir}" -B $script:buildDir $script:cmakeDefs
     if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
-    write-host "building with: cmake --build $script:buildDir --config $script:config $($script:cmakeTargets | ForEach-Object { `"--target`", $_ })"
-    & cmake --build $script:buildDir --config $script:config ($script:cmakeTargets | ForEach-Object { "--target", $_ })
+    if ($cmakeDefs -contains "-G") {
+        $extra=@("-j8")
+    } else {
+        $extra= @("--", "/p:CL_MPcount=8")
+    }
+    write-host "building with: cmake --build $script:buildDir --config $script:config $($script:cmakeTargets | ForEach-Object { `"--target`", $_ }) $extra"
+    & cmake --build $script:buildDir --config $script:config ($script:cmakeTargets | ForEach-Object { "--target", $_ }) $extra
     if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
     # Rearrange output to be consistent between different generators
     if ($null -ne ${script:config} -And (test-path -path "${script:buildDir}/bin/${script:config}" ) ) {
@@ -176,9 +173,9 @@ function cleanup {
 }
 
 
-# -DLLAMA_AVX -- 2011 Intel Sandy Bridge & AMD Bulldozer
-# -DLLAMA_AVX2 -- 2013 Intel Haswell & 2015 AMD Excavator / 2017 AMD Zen
-# -DLLAMA_FMA (FMA3) -- 2013 Intel Haswell & 2012 AMD Piledriver
+# -DGGML_AVX -- 2011 Intel Sandy Bridge & AMD Bulldozer
+# -DGGML_AVX2 -- 2013 Intel Haswell & 2015 AMD Excavator / 2017 AMD Zen
+# -DGGML_FMA (FMA3) -- 2013 Intel Haswell & 2012 AMD Piledriver
 
 
 function build_static() {
@@ -198,12 +195,13 @@ function build_static() {
             "-DCMAKE_C_COMPILER=gcc.exe",
             "-DCMAKE_CXX_COMPILER=g++.exe",
             "-DBUILD_SHARED_LIBS=off",
-            "-DLLAMA_NATIVE=off",
-            "-DLLAMA_AVX=off",
-            "-DLLAMA_AVX2=off",
-            "-DLLAMA_AVX512=off",
-            "-DLLAMA_F16C=off",
-            "-DLLAMA_FMA=off")
+            "-DGGML_NATIVE=off",
+            "-DGGML_AVX=off",
+            "-DGGML_AVX2=off",
+            "-DGGML_AVX512=off",
+            "-DGGML_F16C=off",
+            "-DGGML_FMA=off",
+            "-DGGML_OPENMP=off")
         $script:buildDir="../build/windows/${script:ARCH}_static"
         write-host "Building static library"
         build
@@ -217,7 +215,7 @@ function build_cpu($gen_arch) {
     if ((-not "${env:OLLAMA_SKIP_CPU_GENERATE}" ) -and ((-not "${env:OLLAMA_CPU_TARGET}") -or ("${env:OLLAMA_CPU_TARGET}" -eq "cpu"))) {
         # remaining llama.cpp builds use MSVC 
         init_vars
-        $script:cmakeDefs = $script:commonCpuDefs + @("-A", $gen_arch, "-DLLAMA_AVX=off", "-DLLAMA_AVX2=off", "-DLLAMA_AVX512=off", "-DLLAMA_FMA=off", "-DLLAMA_F16C=off") + $script:cmakeDefs
+        $script:cmakeDefs = $script:commonCpuDefs + @("-A", $gen_arch, "-DGGML_AVX=off", "-DGGML_AVX2=off", "-DGGML_AVX512=off", "-DGGML_FMA=off", "-DGGML_F16C=off") + $script:cmakeDefs
         $script:buildDir="../build/windows/${script:ARCH}/cpu"
         $script:distDir="$script:DIST_BASE\cpu"
         write-host "Building LCD CPU"
@@ -232,7 +230,7 @@ function build_cpu($gen_arch) {
 function build_cpu_avx() {
     if ((-not "${env:OLLAMA_SKIP_CPU_GENERATE}" ) -and ((-not "${env:OLLAMA_CPU_TARGET}") -or ("${env:OLLAMA_CPU_TARGET}" -eq "cpu_avx"))) {
         init_vars
-        $script:cmakeDefs = $script:commonCpuDefs + @("-A", "x64", "-DLLAMA_AVX=on", "-DLLAMA_AVX2=off", "-DLLAMA_AVX512=off", "-DLLAMA_FMA=off", "-DLLAMA_F16C=off") + $script:cmakeDefs
+        $script:cmakeDefs = $script:commonCpuDefs + @("-A", "x64", "-DGGML_AVX=on", "-DGGML_AVX2=off", "-DGGML_AVX512=off", "-DGGML_FMA=off", "-DGGML_F16C=off") + $script:cmakeDefs
         $script:buildDir="../build/windows/${script:ARCH}/cpu_avx"
         $script:distDir="$script:DIST_BASE\cpu_avx"
         write-host "Building AVX CPU"
@@ -247,7 +245,7 @@ function build_cpu_avx() {
 function build_cpu_avx2() {
     if ((-not "${env:OLLAMA_SKIP_CPU_GENERATE}" ) -and ((-not "${env:OLLAMA_CPU_TARGET}") -or ("${env:OLLAMA_CPU_TARGET}" -eq "cpu_avx2"))) {
         init_vars
-        $script:cmakeDefs = $script:commonCpuDefs + @("-A", "x64", "-DLLAMA_AVX=on", "-DLLAMA_AVX2=on", "-DLLAMA_AVX512=off", "-DLLAMA_FMA=on", "-DLLAMA_F16C=on") + $script:cmakeDefs
+        $script:cmakeDefs = $script:commonCpuDefs + @("-A", "x64", "-DGGML_AVX=on", "-DGGML_AVX2=on", "-DGGML_AVX512=off", "-DGGML_FMA=on", "-DGGML_F16C=on") + $script:cmakeDefs
         $script:buildDir="../build/windows/${script:ARCH}/cpu_avx2"
         $script:distDir="$script:DIST_BASE\cpu_avx2"
         write-host "Building AVX2 CPU"
@@ -270,7 +268,15 @@ function build_cuda() {
         init_vars
         $script:buildDir="../build/windows/${script:ARCH}/cuda$script:CUDA_VARIANT"
         $script:distDir="$script:DIST_BASE\cuda$script:CUDA_VARIANT"
-        $script:cmakeDefs += @("-A", "x64", "-DLLAMA_CUDA=ON", "-DLLAMA_AVX=on", "-DLLAMA_AVX2=off", "-DCUDAToolkit_INCLUDE_DIR=$script:CUDA_INCLUDE_DIR", "-DCMAKE_CUDA_ARCHITECTURES=${script:CMAKE_CUDA_ARCHITECTURES}")
+        $script:cmakeDefs += @(
+            "-A", "x64",
+            "-DGGML_CUDA=ON",
+            "-DGGML_AVX=on",
+            "-DGGML_AVX2=off",
+            "-DCUDAToolkit_INCLUDE_DIR=$script:CUDA_INCLUDE_DIR",
+            "-DCMAKE_CUDA_FLAGS=-t8",
+            "-DCMAKE_CUDA_ARCHITECTURES=${script:CMAKE_CUDA_ARCHITECTURES}"
+            )
         if ($null -ne $env:OLLAMA_CUSTOM_CUDA_DEFS) {
             write-host "OLLAMA_CUSTOM_CUDA_DEFS=`"${env:OLLAMA_CUSTOM_CUDA_DEFS}`""
             $script:cmakeDefs +=@("${env:OLLAMA_CUSTOM_CUDA_DEFS}")
@@ -280,10 +286,12 @@ function build_cuda() {
         sign
         install
 
-        write-host "copying CUDA dependencies to ${script:SRC_DIR}\dist\windows-${script:ARCH}\"
-        cp "${script:CUDA_LIB_DIR}\cudart64_*.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\"
-        cp "${script:CUDA_LIB_DIR}\cublas64_*.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\"
-        cp "${script:CUDA_LIB_DIR}\cublasLt64_*.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\"
+        rm -ea 0 -recurse -force -path "${script:SRC_DIR}\dist\windows-${script:ARCH}\cuda\"
+        md "${script:SRC_DIR}\dist\windows-${script:ARCH}\cuda\" -ea 0 > $null
+        write-host "copying CUDA dependencies to ${script:SRC_DIR}\dist\windows-${script:ARCH}\cuda\"
+        cp "${script:CUDA_LIB_DIR}\cudart64_*.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\cuda\"
+        cp "${script:CUDA_LIB_DIR}\cublas64_*.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\cuda\"
+        cp "${script:CUDA_LIB_DIR}\cublasLt64_*.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\cuda\"
     } else {
         write-host "Skipping CUDA generation step"
     }
@@ -302,7 +310,7 @@ function build_oneapi() {
     $script:distDir ="$script:DIST_BASE\oneapi$script:ONEAPI_VARIANT"
     $script:cmakeDefs += @(
       "-G", "MinGW Makefiles",
-      "-DLLAMA_SYCL=ON",
+      "-DGGML_SYCL=ON",
       "-DCMAKE_C_COMPILER=icx",
       "-DCMAKE_CXX_COMPILER=icx",
       "-DCMAKE_BUILD_TYPE=Release"
@@ -317,16 +325,18 @@ function build_oneapi() {
     sign
     install
 
-    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\libirngmd.dll" "${script:distDir}"
-    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\libmmd.dll" "${script:distDir}"
-    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\pi_level_zero.dll" "${script:distDir}"
-    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\pi_unified_runtime.dll" "${script:distDir}"
-    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\pi_win_proxy_loader.dll" "${script:distDir}"
-    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\svml_dispmd.dll" "${script:distDir}"
-    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\sycl7.dll" "${script:distDir}"
-    cp "${env:ONEAPI_ROOT}\mkl\latest\bin\mkl_core.2.dll" "${script:distDir}"
-    cp "${env:ONEAPI_ROOT}\mkl\latest\bin\mkl_sycl_blas.4.dll" "${script:distDir}"
-    cp "${env:ONEAPI_ROOT}\mkl\latest\bin\mkl_tbb_thread.2.dll" "${script:distDir}"
+    rm -ea 0 -recurse -force -path "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    md "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\" -ea 0 > $null
+    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\libirngmd.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\libmmd.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\pi_level_zero.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\pi_unified_runtime.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\pi_win_proxy_loader.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\svml_dispmd.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    cp "${env:ONEAPI_ROOT}\compiler\latest\bin\sycl7.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    cp "${env:ONEAPI_ROOT}\mkl\latest\bin\mkl_core.2.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    cp "${env:ONEAPI_ROOT}\mkl\latest\bin\mkl_sycl_blas.4.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
+    cp "${env:ONEAPI_ROOT}\mkl\latest\bin\mkl_tbb_thread.2.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\oneapi\"
   } else {
     Write-Host "Skipping oneAPI generation step"
   }
@@ -346,10 +356,11 @@ function build_rocm() {
             "-G", "Ninja", 
             "-DCMAKE_C_COMPILER=clang.exe",
             "-DCMAKE_CXX_COMPILER=clang++.exe",
-            "-DLLAMA_HIPBLAS=on",
+            "-DGGML_HIPBLAS=on",
+            "-DLLAMA_CUDA_NO_PEER_COPY=on",
             "-DHIP_PLATFORM=amd",
-            "-DLLAMA_AVX=on",
-            "-DLLAMA_AVX2=off",
+            "-DGGML_AVX=on",
+            "-DGGML_AVX2=off",
             "-DCMAKE_POSITION_INDEPENDENT_CODE=on",
             "-DAMDGPU_TARGETS=$(amdGPUs)",
             "-DGPU_TARGETS=$(amdGPUs)"
@@ -375,7 +386,6 @@ function build_rocm() {
         sign
         install
 
-        # Assumes v5.7, may need adjustments for v6
         rm -ea 0 -recurse -force -path "${script:SRC_DIR}\dist\windows-${script:ARCH}\rocm\"
         md "${script:SRC_DIR}\dist\windows-${script:ARCH}\rocm\rocblas\library\" -ea 0 > $null
         cp "${env:HIP_PATH}\bin\hipblas.dll" "${script:SRC_DIR}\dist\windows-${script:ARCH}\rocm\"

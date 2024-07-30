@@ -65,6 +65,7 @@ curl http://localhost:11434/v1/chat/completions \
             }
         ]
     }'
+
 ```
 
 ## Endpoints
@@ -77,8 +78,8 @@ curl http://localhost:11434/v1/chat/completions \
 - [x] Streaming
 - [x] JSON mode
 - [x] Reproducible outputs
+- [x] Tools (streaming support coming soon)
 - [ ] Vision
-- [ ] Function calling
 - [ ] Logprobs
 
 #### Supported request fields
@@ -96,17 +97,11 @@ curl http://localhost:11434/v1/chat/completions \
 - [x] `temperature`
 - [x] `top_p`
 - [x] `max_tokens`
-- [ ] `logit_bias`
-- [ ] `tools`
+- [x] `tools`
 - [ ] `tool_choice`
+- [ ] `logit_bias`
 - [ ] `user`
 - [ ] `n`
-
-#### Notes
-
-- Setting `seed` will always set `temperature` to `0`
-- `finish_reason` will always be `stop`
-- `usage.prompt_tokens` will be 0 for completions where prompt evaluation is cached
 
 ## Models
 

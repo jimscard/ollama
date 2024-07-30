@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 )
 
@@ -20,12 +22,12 @@ const (
 
 var (
 	// Used to validate if the given ROCm lib is usable
-	ROCmLibGlobs          = []string{"hipblas.dll", "rocblas"}                 // TODO - probably include more coverage of files here...
-	RocmStandardLocations = []string{"C:\\Program Files\\AMD\\ROCm\\5.7\\bin"} // TODO glob?
+	ROCmLibGlobs          = []string{"hipblas.dll", "rocblas"}                 // This is not sufficient to discern v5 vs v6
+	RocmStandardLocations = []string{"C:\\Program Files\\AMD\\ROCm\\6.1\\bin"} // TODO glob?
 )
 
-func AMDGetGPUInfo() []GpuInfo {
-	resp := []GpuInfo{}
+func AMDGetGPUInfo() []RocmGPUInfo {
+	resp := []RocmGPUInfo{}
 	hl, err := NewHipLib()
 	if err != nil {
 		slog.Debug(err.Error())
@@ -33,12 +35,11 @@ func AMDGetGPUInfo() []GpuInfo {
 	}
 	defer hl.Release()
 
-	// TODO - this reports incorrect version information, so omitting for now
-	// driverMajor, driverMinor, err := hl.AMDDriverVersion()
-	// if err != nil {
-	// 	// For now this is benign, but we may eventually need to fail compatibility checks
-	// 	slog.Debug("error looking up amd driver version", "error", err)
-	// }
+	driverMajor, driverMinor, err := hl.AMDDriverVersion()
+	if err != nil {
+		// For now this is benign, but we may eventually need to fail compatibility checks
+		slog.Debug("error looking up amd driver version", "error", err)
+	}
 
 	// Note: the HIP library automatically handles subsetting to any HIP_VISIBLE_DEVICES the user specified
 	count := hl.HipGetDeviceCount()
@@ -52,7 +53,7 @@ func AMDGetGPUInfo() []GpuInfo {
 	}
 
 	var supported []string
-	gfxOverride := os.Getenv("HSA_OVERRIDE_GFX_VERSION")
+	gfxOverride := envconfig.HsaOverrideGfxVersion
 	if gfxOverride == "" {
 		supported, err = GetSupportedGFX(libDir)
 		if err != nil {
@@ -91,7 +92,8 @@ func AMDGetGPUInfo() []GpuInfo {
 			continue
 		}
 		if gfxOverride == "" {
-			if !slices.Contains[[]string, string](supported, gfx) {
+			// Strip off Target Features when comparing
+			if !slices.Contains[[]string, string](supported, strings.Split(gfx, ":")[0]) {
 				slog.Warn("amdgpu is not supported", "gpu", i, "gpu_type", gfx, "library", libDir, "supported_types", supported)
 				// TODO - consider discrete markdown just for ROCM troubleshooting?
 				slog.Warn("See https://github.com/ollama/ollama/blob/main/docs/troubleshooting.md for HSA_OVERRIDE_GFX_VERSION usage")
@@ -113,25 +115,27 @@ func AMDGetGPUInfo() []GpuInfo {
 			continue
 		}
 
-		// TODO revisit this once ROCm v6 is available on windows.
-		// v5.7 only reports VRAM used by this process, so it's completely wrong and unusable
 		slog.Debug("amdgpu memory", "gpu", i, "total", format.HumanBytes2(totalMemory))
 		slog.Debug("amdgpu memory", "gpu", i, "available", format.HumanBytes2(freeMemory))
-		gpuInfo := GpuInfo{
-			Library: "rocm",
-			memInfo: memInfo{
-				TotalMemory: totalMemory,
-				FreeMemory:  freeMemory,
-			},
-			ID:             fmt.Sprintf("%d", i), // TODO this is probably wrong if we specify visible devices
-			DependencyPath: libDir,
-			MinimumMemory:  rocmMinimumMemory,
-			Name:           name,
-			Compute:        gfx,
+		gpuInfo := RocmGPUInfo{
+			GpuInfo: GpuInfo{
+				Library: "rocm",
+				memInfo: memInfo{
+					TotalMemory: totalMemory,
+					FreeMemory:  freeMemory,
+				},
+				// Free memory reporting on Windows is not reliable until we bump to ROCm v6.2
+				UnreliableFreeMemory: true,
 
-			// TODO - this information isn't accurate on windows, so don't report it until we find the right way to retrieve
-			// DriverMajor:    driverMajor,
-			// DriverMinor:    driverMinor,
+				ID:             strconv.Itoa(i), // TODO this is probably wrong if we specify visible devices
+				DependencyPath: libDir,
+				MinimumMemory:  rocmMinimumMemory,
+				Name:           name,
+				Compute:        gfx,
+				DriverMajor:    driverMajor,
+				DriverMinor:    driverMinor,
+			},
+			index: i,
 		}
 
 		resp = append(resp, gpuInfo)
@@ -158,4 +162,31 @@ func AMDValidateLibDir() (string, error) {
 	// Should not happen on windows since we include it in the installer, but stand-alone binary might hit this
 	slog.Warn("amdgpu detected, but no compatible rocm library found.  Please install ROCm")
 	return "", fmt.Errorf("no suitable rocm found, falling back to CPU")
+}
+
+func (gpus RocmGPUInfoList) RefreshFreeMemory() error {
+	if len(gpus) == 0 {
+		return nil
+	}
+	hl, err := NewHipLib()
+	if err != nil {
+		slog.Debug(err.Error())
+		return nil
+	}
+	defer hl.Release()
+
+	for i := range gpus {
+		err := hl.HipSetDevice(gpus[i].index)
+		if err != nil {
+			return err
+		}
+		freeMemory, _, err := hl.HipMemGetInfo()
+		if err != nil {
+			slog.Warn("get mem info", "id", i, "error", err)
+			continue
+		}
+		slog.Debug("updating rocm free memory", "gpu", gpus[i].ID, "name", gpus[i].Name, "before", format.HumanBytes2(gpus[i].FreeMemory), "now", format.HumanBytes2(freeMemory))
+		gpus[i].FreeMemory = freeMemory
+	}
+	return nil
 }
