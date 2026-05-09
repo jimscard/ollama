@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -29,6 +31,7 @@ import (
 	"github.com/containerd/console"
 	"github.com/mattn/go-runewidth"
 	"github.com/olekukonko/tablewriter"
+	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/errgroup"
@@ -36,8 +39,12 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/cmd/config"
+	"github.com/ollama/ollama/cmd/launch"
+	"github.com/ollama/ollama/cmd/tui"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
+	"github.com/ollama/ollama/internal/modelref"
+	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/progress"
 	"github.com/ollama/ollama/readline"
@@ -47,12 +54,87 @@ import (
 	"github.com/ollama/ollama/types/syncmap"
 	"github.com/ollama/ollama/version"
 	xcmd "github.com/ollama/ollama/x/cmd"
-	"github.com/ollama/ollama/x/create"
+	xcreate "github.com/ollama/ollama/x/create"
 	xcreateclient "github.com/ollama/ollama/x/create/client"
 	"github.com/ollama/ollama/x/imagegen"
 )
 
-const ConnectInstructions = "To sign in, navigate to:\n    %s\n\n"
+func init() {
+	// Override default selectors to use Bubbletea TUI instead of raw terminal I/O.
+	launch.DefaultSingleSelector = func(title string, items []launch.SelectionItem, current string) (string, error) {
+		return runTUISingleSelector(title, items, current, nil)
+	}
+
+	launch.DefaultSingleSelectorWithUpdates = func(title string, items []launch.SelectionItem, current string, updates <-chan []launch.SelectionItem) (string, error) {
+		return runTUISingleSelector(title, items, current, updates)
+	}
+
+	launch.DefaultMultiSelector = func(title string, items []launch.SelectionItem, preChecked []string) ([]string, error) {
+		return runTUIMultiSelector(title, items, preChecked, nil)
+	}
+
+	launch.DefaultMultiSelectorWithUpdates = func(title string, items []launch.SelectionItem, preChecked []string, updates <-chan []launch.SelectionItem) ([]string, error) {
+		return runTUIMultiSelector(title, items, preChecked, updates)
+	}
+
+	launch.DefaultSignIn = func(modelName, signInURL string) (string, error) {
+		userName, err := tui.RunSignIn(modelName, signInURL)
+		if errors.Is(err, tui.ErrCancelled) {
+			return "", launch.ErrCancelled
+		}
+		return userName, err
+	}
+
+	launch.DefaultUpgrade = func(modelName, requiredPlan string) (string, error) {
+		plan, err := tui.RunUpgrade(modelName, requiredPlan)
+		if errors.Is(err, tui.ErrCancelled) {
+			return "", launch.ErrCancelled
+		}
+		return plan, err
+	}
+
+	launch.DefaultConfirmPrompt = tui.RunConfirmWithOptions
+}
+
+func runTUISingleSelector(title string, items []launch.SelectionItem, current string, updates <-chan []launch.SelectionItem) (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+		return "", fmt.Errorf("model selection requires an interactive terminal; use --model to run in headless mode")
+	}
+	tuiItems := tui.ReorderItems(tui.ConvertItems(items))
+	result, err := tui.SelectSingleWithUpdates(title, tuiItems, current, convertSelectionItemUpdates(updates))
+	if errors.Is(err, tui.ErrCancelled) {
+		return "", launch.ErrCancelled
+	}
+	return result, err
+}
+
+func runTUIMultiSelector(title string, items []launch.SelectionItem, preChecked []string, updates <-chan []launch.SelectionItem) ([]string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+		return nil, fmt.Errorf("model selection requires an interactive terminal; use --model to run in headless mode")
+	}
+	tuiItems := tui.ReorderItems(tui.ConvertItems(items))
+	result, err := tui.SelectMultipleWithUpdates(title, tuiItems, preChecked, convertSelectionItemUpdates(updates))
+	if errors.Is(err, tui.ErrCancelled) {
+		return nil, launch.ErrCancelled
+	}
+	return result, err
+}
+
+func convertSelectionItemUpdates(updates <-chan []launch.SelectionItem) <-chan []tui.SelectItem {
+	if updates == nil {
+		return nil
+	}
+	out := make(chan []tui.SelectItem, 1)
+	go func() {
+		defer close(out)
+		for items := range updates {
+			out <- tui.ReorderItems(tui.ConvertItems(items))
+		}
+	}()
+	return out
+}
+
+const ConnectInstructions = "If your browser did not open, navigate to:\n    %s\n\n"
 
 // ensureThinkingSupport emits a warning if the model does not advertise thinking support
 func ensureThinkingSupport(ctx context.Context, client *api.Client, name string) {
@@ -91,6 +173,50 @@ func getModelfileName(cmd *cobra.Command) (string, error) {
 	return absName, nil
 }
 
+// isLocalhost returns true if the configured Ollama host is a loopback or unspecified address.
+func isLocalhost() bool {
+	host := envconfig.Host()
+	h, _, _ := net.SplitHostPort(host.Host)
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
+}
+
+func resolveExperimentalLocalModelDir(ref, filename string) string {
+	if ref == "" || filepath.IsAbs(ref) || filename == "" {
+		return ref
+	}
+
+	candidate := filepath.Join(filepath.Dir(filename), ref)
+	if xcreate.IsSafetensorsModelDir(candidate) || xcreate.IsTensorModelDir(candidate) {
+		return candidate
+	}
+
+	return ref
+}
+
+func resolveExperimentalDraftDir(ref, filename string) (string, error) {
+	if ref == "" {
+		return "", nil
+	}
+	if filepath.IsAbs(ref) {
+		if xcreate.IsSafetensorsModelDir(ref) {
+			return ref, nil
+		}
+		return "", fmt.Errorf("draft %s is not a supported safetensors model directory", ref)
+	}
+	if filename != "" {
+		candidate := filepath.Join(filepath.Dir(filename), ref)
+		if xcreate.IsSafetensorsModelDir(candidate) {
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf("DRAFT model references are not supported with --experimental yet: %s", ref)
+}
+
 func CreateHandler(cmd *cobra.Command, args []string) error {
 	p := progress.NewProgress(os.Stderr)
 	defer p.Stop()
@@ -103,8 +229,17 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check for --experimental flag for safetensors model creation
+	// This gates both safetensors LLM and imagegen model creation
 	experimental, _ := cmd.Flags().GetBool("experimental")
+	draftQuantize, _ := cmd.Flags().GetString("draft-quantize")
+	if draftQuantize != "" && !experimental {
+		return errors.New("--draft-quantize requires --experimental")
+	}
 	if experimental {
+		if !isLocalhost() {
+			return errors.New("remote safetensor model creation not yet supported")
+		}
+
 		// Get Modelfile content - either from -f flag or default to "FROM ."
 		var reader io.Reader
 		filename, err := getModelfileName(cmd)
@@ -128,55 +263,36 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to parse Modelfile: %w", err)
 		}
 
-		// Extract FROM path and configuration
-		var modelDir string
-		mfConfig := &xcreateclient.ModelfileConfig{}
+		modelDir, mfConfig, err := xcreateclient.ConfigFromModelfile(modelfile)
+		if err != nil {
+			return err
+		}
 
-		for _, cmd := range modelfile.Commands {
-			switch cmd.Name {
-			case "model":
-				modelDir = cmd.Args
-			case "template":
-				mfConfig.Template = cmd.Args
-			case "system":
-				mfConfig.System = cmd.Args
-			case "license":
-				mfConfig.License = cmd.Args
+		modelDir = resolveExperimentalLocalModelDir(modelDir, filename)
+		if mfConfig.Draft != "" {
+			draftDir, err := resolveExperimentalDraftDir(mfConfig.Draft, filename)
+			if err != nil {
+				return err
 			}
-		}
-
-		if modelDir == "" {
-			modelDir = "."
-		}
-
-		// Resolve relative paths based on Modelfile location
-		if !filepath.IsAbs(modelDir) && filename != "" {
-			modelDir = filepath.Join(filepath.Dir(filename), modelDir)
+			mfConfig.Draft = draftDir
 		}
 
 		quantize, _ := cmd.Flags().GetString("quantize")
 		return xcreateclient.CreateModel(xcreateclient.CreateOptions{
-			ModelName: modelName,
-			ModelDir:  modelDir,
-			Quantize:  quantize,
-			Modelfile: mfConfig,
+			ModelName:     modelName,
+			ModelDir:      modelDir,
+			Quantize:      quantize,
+			DraftQuantize: draftQuantize,
+			Modelfile:     mfConfig,
 		}, p)
 	}
 
+	// Standard Modelfile + API path
 	var reader io.Reader
 
 	filename, err := getModelfileName(cmd)
 	if os.IsNotExist(err) {
 		if filename == "" {
-			// No Modelfile found - check if current directory is an image gen model
-			if create.IsTensorModelDir(".") {
-				quantize, _ := cmd.Flags().GetString("quantize")
-				return xcreateclient.CreateModel(xcreateclient.CreateOptions{
-					ModelName: modelName,
-					ModelDir:  ".",
-					Quantize:  quantize,
-				}, p)
-			}
 			reader = strings.NewReader("FROM .\n")
 		} else {
 			return errModelfileNotFound
@@ -362,18 +478,35 @@ func loadOrUnloadModel(cmd *cobra.Command, opts *runOptions) error {
 		return err
 	}
 
+	requestedCloud := modelref.HasExplicitCloudSource(opts.Model)
+
 	if info, err := client.Show(cmd.Context(), &api.ShowRequest{Model: opts.Model}); err != nil {
 		return err
-	} else if info.RemoteHost != "" {
+	} else if info.RemoteHost != "" || requestedCloud {
 		// Cloud model, no need to load/unload
-		if opts.ShowConnect {
-			p.StopAndClear()
-			if strings.HasPrefix(info.RemoteHost, "https://ollama.com") {
-				fmt.Fprintf(os.Stderr, "Connecting to '%s' on 'ollama.com' ⚡\n", info.RemoteModel)
-			} else {
-				fmt.Fprintf(os.Stderr, "Connecting to '%s' on '%s'\n", info.RemoteModel, info.RemoteHost)
+
+		isCloud := requestedCloud || strings.HasPrefix(info.RemoteHost, "https://ollama.com")
+
+		// Check if user is signed in for ollama.com cloud models
+		if isCloud {
+			if _, err := client.Whoami(cmd.Context()); err != nil {
+				return err
 			}
 		}
+
+		if opts.ShowConnect {
+			p.StopAndClear()
+			remoteModel := info.RemoteModel
+			if remoteModel == "" {
+				remoteModel = opts.Model
+			}
+			if isCloud {
+				fmt.Fprintf(os.Stderr, "Connecting to '%s' on 'ollama.com' ⚡\n", remoteModel)
+			} else {
+				fmt.Fprintf(os.Stderr, "Connecting to '%s' on '%s'\n", remoteModel, info.RemoteHost)
+			}
+		}
+
 		return nil
 	}
 
@@ -442,6 +575,64 @@ func generateEmbedding(cmd *cobra.Command, modelName, input string, keepAlive *a
 	return nil
 }
 
+// TODO(parthsareen): consolidate with TUI signin flow
+func handleCloudAuthorizationError(err error) bool {
+	var authErr api.AuthorizationError
+	if errors.As(err, &authErr) && authErr.StatusCode == http.StatusUnauthorized {
+		fmt.Printf("You need to be signed in to Ollama to run Cloud models.\n\n")
+		if authErr.SigninURL != "" {
+			fmt.Printf(ConnectInstructions, authErr.SigninURL)
+		}
+		return true
+	}
+
+	return false
+}
+
+// TEMP(drifkin): To match legacy `ollama run some-model:cloud` behavior, we
+// best-effort pull cloud stub files for any explicit cloud source models.
+// Remove this once `/api/tags` is cloud-aware.
+func ensureCloudStub(ctx context.Context, client *api.Client, modelName string) {
+	if !modelref.HasExplicitCloudSource(modelName) {
+		return
+	}
+
+	normalizedName, _, err := modelref.NormalizePullName(modelName)
+	if err != nil {
+		slog.Warn("failed to normalize pull name", "model", modelName, "error", err, "normalizedName", normalizedName)
+		return
+	}
+
+	listResp, err := client.List(ctx)
+	if err != nil {
+		slog.Warn("failed to list models", "error", err)
+		return
+	}
+
+	if hasListedModelName(listResp.Models, modelName) || hasListedModelName(listResp.Models, normalizedName) {
+		return
+	}
+
+	logutil.Trace("pulling cloud stub", "model", modelName, "normalizedName", normalizedName)
+	err = client.Pull(ctx, &api.PullRequest{
+		Model: normalizedName,
+	}, func(api.ProgressResponse) error {
+		return nil
+	})
+	if err != nil {
+		slog.Warn("failed to pull cloud stub", "model", modelName, "error", err)
+	}
+}
+
+func hasListedModelName(models []api.ListModelResponse, name string) bool {
+	for _, m := range models {
+		if strings.EqualFold(m.Name, name) || strings.EqualFold(m.Model, name) {
+			return true
+		}
+	}
+	return false
+}
+
 func RunHandler(cmd *cobra.Command, args []string) error {
 	interactive := true
 
@@ -472,10 +663,10 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 			opts.Think = &api.ThinkValue{Value: true}
 		case "false":
 			opts.Think = &api.ThinkValue{Value: false}
-		case "high", "medium", "low":
+		case "high", "medium", "low", "max":
 			opts.Think = &api.ThinkValue{Value: thinkStr}
 		default:
-			return fmt.Errorf("invalid value for --think: %q (must be true, false, high, medium, or low)", thinkStr)
+			return fmt.Errorf("invalid value for --think: %q (must be true, false, high, medium, low, or max)", thinkStr)
 		}
 	} else {
 		opts.Think = nil
@@ -538,12 +729,16 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	name := args[0]
+	requestedCloud := modelref.HasExplicitCloudSource(name)
 
 	info, err := func() (*api.ShowResponse, error) {
 		showReq := &api.ShowRequest{Name: name}
 		info, err := client.Show(cmd.Context(), showReq)
 		var se api.StatusError
 		if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
+			if requestedCloud {
+				return nil, err
+			}
 			if err := PullHandler(cmd, []string{name}); err != nil {
 				return nil, err
 			}
@@ -552,15 +747,21 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		return info, err
 	}()
 	if err != nil {
+		if handleCloudAuthorizationError(err) {
+			return nil
+		}
 		return err
 	}
+
+	ensureCloudStub(cmd.Context(), client, name)
 
 	opts.Think, err = inferThinkingOption(&info.Capabilities, &opts, thinkFlag.Changed)
 	if err != nil {
 		return err
 	}
 
-	opts.MultiModal = slices.Contains(info.Capabilities, model.CapabilityVision)
+	audioCapable := slices.Contains(info.Capabilities, model.CapabilityAudio)
+	opts.MultiModal = slices.Contains(info.Capabilities, model.CapabilityVision) || audioCapable
 
 	// TODO: remove the projector info and vision info checks below,
 	// these are left in for backwards compatibility with older servers
@@ -575,7 +776,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	opts.ParentModel = info.Details.ParentModel
+	applyShowResponseToRunOptions(&opts, info)
 
 	// Check if this is an embedding model
 	isEmbeddingModel := slices.Contains(info.Capabilities, model.CapabilityEmbedding)
@@ -646,7 +847,13 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 
 		return generateInteractive(cmd, opts)
 	}
-	return generate(cmd, opts)
+	if err := generate(cmd, opts); err != nil {
+		if handleCloudAuthorizationError(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func SigninHandler(cmd *cobra.Command, args []string) error {
@@ -663,6 +870,7 @@ func SigninHandler(cmd *cobra.Command, args []string) error {
 			fmt.Println()
 
 			if aErr.SigninURL != "" {
+				_ = browser.OpenURL(aErr.SigninURL)
 				fmt.Printf(ConnectInstructions, aErr.SigninURL)
 			}
 			return nil
@@ -1284,23 +1492,30 @@ func PullHandler(cmd *cobra.Command, args []string) error {
 type generateContextKey string
 
 type runOptions struct {
-	Model        string
-	ParentModel  string
-	Prompt       string
-	Messages     []api.Message
-	WordWrap     bool
-	Format       string
-	System       string
-	Images       []api.ImageData
-	Options      map[string]any
-	MultiModal   bool
-	KeepAlive    *api.Duration
-	Think        *api.ThinkValue
-	HideThinking bool
-	ShowConnect  bool
+	Model          string
+	ParentModel    string
+	LoadedMessages []api.Message
+	Prompt         string
+	Messages       []api.Message
+	WordWrap       bool
+	Format         string
+	System         string
+	Images         []api.ImageData
+	Options        map[string]any
+	MultiModal     bool
+	KeepAlive      *api.Duration
+	Think          *api.ThinkValue
+	HideThinking   bool
+	ShowConnect    bool
 }
 
 func (r runOptions) Copy() runOptions {
+	var loadedMessages []api.Message
+	if r.LoadedMessages != nil {
+		loadedMessages = make([]api.Message, len(r.LoadedMessages))
+		copy(loadedMessages, r.LoadedMessages)
+	}
+
 	var messages []api.Message
 	if r.Messages != nil {
 		messages = make([]api.Message, len(r.Messages))
@@ -1328,21 +1543,27 @@ func (r runOptions) Copy() runOptions {
 	}
 
 	return runOptions{
-		Model:        r.Model,
-		ParentModel:  r.ParentModel,
-		Prompt:       r.Prompt,
-		Messages:     messages,
-		WordWrap:     r.WordWrap,
-		Format:       r.Format,
-		System:       r.System,
-		Images:       images,
-		Options:      opts,
-		MultiModal:   r.MultiModal,
-		KeepAlive:    r.KeepAlive,
-		Think:        think,
-		HideThinking: r.HideThinking,
-		ShowConnect:  r.ShowConnect,
+		Model:          r.Model,
+		ParentModel:    r.ParentModel,
+		LoadedMessages: loadedMessages,
+		Prompt:         r.Prompt,
+		Messages:       messages,
+		WordWrap:       r.WordWrap,
+		Format:         r.Format,
+		System:         r.System,
+		Images:         images,
+		Options:        opts,
+		MultiModal:     r.MultiModal,
+		KeepAlive:      r.KeepAlive,
+		Think:          think,
+		HideThinking:   r.HideThinking,
+		ShowConnect:    r.ShowConnect,
 	}
+}
+
+func applyShowResponseToRunOptions(opts *runOptions, info *api.ShowResponse) {
+	opts.ParentModel = info.Details.ParentModel
+	opts.LoadedMessages = slices.Clone(info.Messages)
 }
 
 type displayResponseState struct {
@@ -1352,6 +1573,9 @@ type displayResponseState struct {
 
 func displayResponse(content string, wordWrap bool, state *displayResponseState) {
 	termWidth, _, _ := term.GetSize(int(os.Stdout.Fd()))
+	if termWidth == 0 {
+		termWidth = 80
+	}
 	if wordWrap && termWidth >= 10 {
 		for _, ch := range content {
 			if state.lineLength+1 > termWidth-5 {
@@ -1750,7 +1974,7 @@ func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 		if err := startApp(cmd.Context(), client); err != nil {
-			return fmt.Errorf("ollama server not responding - %w", err)
+			return err
 		}
 	}
 	return nil
@@ -1785,10 +2009,233 @@ func appendEnvDocs(cmd *cobra.Command, envs []envconfig.EnvVar) {
 Environment Variables:
 `
 	for _, e := range envs {
-		envUsage += fmt.Sprintf("      %-24s   %s\n", e.Name, e.Description)
+		envUsage += fmt.Sprintf("      %-27s   %s\n", e.Name, e.Description)
 	}
 
 	cmd.SetUsageTemplate(cmd.UsageTemplate() + envUsage)
+}
+
+// ensureServerRunning checks if the ollama server is running and starts it in the background if not.
+func ensureServerRunning(ctx context.Context) error {
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return err
+	}
+
+	// Check if server is already running
+	if err := client.Heartbeat(ctx); err == nil {
+		return nil // server is already running
+	}
+
+	// Server not running, start it in the background
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("could not find executable: %w", err)
+	}
+
+	serverCmd := exec.CommandContext(ctx, exe, "serve")
+	serverCmd.Env = os.Environ()
+	serverCmd.SysProcAttr = backgroundServerSysProcAttr()
+	if err := serverCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start server: %w", err)
+	}
+
+	// Wait for the server to be ready
+	for {
+		time.Sleep(500 * time.Millisecond)
+		if err := client.Heartbeat(ctx); err == nil {
+			return nil // server has started
+		}
+	}
+}
+
+func launchInteractiveModel(cmd *cobra.Command, modelName string) error {
+	opts := runOptions{
+		Model:       modelName,
+		WordWrap:    os.Getenv("TERM") == "xterm-256color",
+		Options:     map[string]any{},
+		ShowConnect: true,
+	}
+
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return err
+	}
+
+	requestedCloud := modelref.HasExplicitCloudSource(modelName)
+
+	info, err := func() (*api.ShowResponse, error) {
+		showReq := &api.ShowRequest{Name: modelName}
+		info, err := client.Show(cmd.Context(), showReq)
+		var se api.StatusError
+		if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
+			if requestedCloud {
+				return nil, err
+			}
+			if err := PullHandler(cmd, []string{modelName}); err != nil {
+				return nil, err
+			}
+			return client.Show(cmd.Context(), &api.ShowRequest{Name: modelName})
+		}
+		return info, err
+	}()
+	if err != nil {
+		if handleCloudAuthorizationError(err) {
+			return nil
+		}
+		return err
+	}
+
+	ensureCloudStub(cmd.Context(), client, modelName)
+
+	opts.Think, err = inferThinkingOption(&info.Capabilities, &opts, false)
+	if err != nil {
+		return err
+	}
+
+	audioCapable := slices.Contains(info.Capabilities, model.CapabilityAudio)
+	opts.MultiModal = slices.Contains(info.Capabilities, model.CapabilityVision) || audioCapable
+
+	// TODO: remove the projector info and vision info checks below,
+	// these are left in for backwards compatibility with older servers
+	// that don't have the capabilities field in the model info
+	if len(info.ProjectorInfo) != 0 {
+		opts.MultiModal = true
+	}
+	for k := range info.ModelInfo {
+		if strings.Contains(k, ".vision.") {
+			opts.MultiModal = true
+			break
+		}
+	}
+
+	applyShowResponseToRunOptions(&opts, info)
+
+	if err := loadOrUnloadModel(cmd, &opts); err != nil {
+		return fmt.Errorf("error loading model: %w", err)
+	}
+	if err := generateInteractive(cmd, opts); err != nil {
+		return fmt.Errorf("error running model: %w", err)
+	}
+	return nil
+}
+
+// runInteractiveTUI runs the main interactive TUI menu.
+func runInteractiveTUI(cmd *cobra.Command) {
+	// Ensure the server is running before showing the TUI
+	if err := ensureServerRunning(cmd.Context()); err != nil {
+		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
+		return
+	}
+
+	accountPrefetch := launch.StartAccountStatePrefetch(cmd.Context())
+	deps := launcherDeps{
+		buildState:          launch.BuildLauncherState,
+		runMenu:             tui.RunMenu,
+		resolveRunModel:     launch.ResolveRunModel,
+		launchIntegration:   launch.LaunchIntegration,
+		runModel:            launchInteractiveModel,
+		accountState:        accountPrefetch.StateIfReady,
+		accountStateUpdates: accountPrefetch.StateUpdates,
+	}
+
+	for {
+		continueLoop, err := runInteractiveTUIStep(cmd, deps)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+		if !continueLoop {
+			return
+		}
+	}
+}
+
+type launcherDeps struct {
+	buildState          func(context.Context) (*launch.LauncherState, error)
+	runMenu             func(*launch.LauncherState) (tui.TUIAction, error)
+	resolveRunModel     func(context.Context, launch.RunModelRequest) (string, error)
+	launchIntegration   func(context.Context, launch.IntegrationLaunchRequest) error
+	runModel            func(*cobra.Command, string) error
+	accountState        func() *launch.AccountState
+	accountStateUpdates func(context.Context) <-chan *launch.AccountState
+}
+
+func runInteractiveTUIStep(cmd *cobra.Command, deps launcherDeps) (bool, error) {
+	state, err := deps.buildState(cmd.Context())
+	if err != nil {
+		return false, fmt.Errorf("build launcher state: %w", err)
+	}
+	if state != nil && deps.accountState != nil {
+		state.AccountState = deps.accountState()
+	}
+
+	action, err := deps.runMenu(state)
+	if err != nil {
+		return false, fmt.Errorf("run launcher menu: %w", err)
+	}
+
+	return runLauncherAction(cmd, action, deps)
+}
+
+func saveLauncherSelection(action tui.TUIAction) {
+	// Best effort only: this affects menu recall, not launch correctness.
+	_ = config.SetLastSelection(action.LastSelection())
+}
+
+func runLauncherAction(cmd *cobra.Command, action tui.TUIAction, deps launcherDeps) (bool, error) {
+	switch action.Kind {
+	case tui.TUIActionNone:
+		return false, nil
+	case tui.TUIActionRunModel:
+		saveLauncherSelection(action)
+		req := action.RunModelRequest()
+		if deps.accountState != nil {
+			req.AccountState = deps.accountState()
+			req.AccountStateProvider = deps.accountState
+		}
+		req.AccountStateUpdates = deps.accountStateUpdates
+		modelName, err := deps.resolveRunModel(cmd.Context(), req)
+		if errors.Is(err, launch.ErrCancelled) {
+			return true, nil
+		}
+		if err != nil {
+			return true, fmt.Errorf("selecting model: %w", err)
+		}
+		if err := deps.runModel(cmd, modelName); err != nil {
+			return true, err
+		}
+		return true, nil
+	case tui.TUIActionLaunchIntegration:
+		saveLauncherSelection(action)
+		req := action.IntegrationLaunchRequest()
+		if deps.accountState != nil {
+			req.AccountState = deps.accountState()
+			req.AccountStateProvider = deps.accountState
+		}
+		req.AccountStateUpdates = deps.accountStateUpdates
+		err := deps.launchIntegration(cmd.Context(), req)
+		if errors.Is(err, launch.ErrCancelled) {
+			return true, nil
+		}
+		if err != nil {
+			return true, fmt.Errorf("launching %s: %w", action.Integration, err)
+		}
+		if launcherActionExitsLoop(action.Integration) {
+			return false, nil
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("unknown launcher action: %d", action.Kind)
+	}
+}
+
+func launcherActionExitsLoop(integration string) bool {
+	switch integration {
+	case "vscode":
+		return true
+	default:
+		return false
+	}
 }
 
 func NewCLI() *cobra.Command {
@@ -1813,11 +2260,13 @@ func NewCLI() *cobra.Command {
 				return
 			}
 
-			cmd.Print(cmd.UsageString())
+			runInteractiveTUI(cmd)
 		},
 	}
 
 	rootCmd.Flags().BoolP("version", "v", false, "Show version information")
+	rootCmd.Flags().Bool("verbose", false, "Show timings for response")
+	rootCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
 
 	createCmd := &cobra.Command{
 		Use:   "create MODEL",
@@ -1828,6 +2277,9 @@ func NewCLI() *cobra.Command {
 			if experimental, _ := cmd.Flags().GetBool("experimental"); experimental {
 				return nil
 			}
+			if draftQuantize, _ := cmd.Flags().GetString("draft-quantize"); draftQuantize != "" {
+				return errors.New("--draft-quantize requires --experimental")
+			}
 			return checkServerHeartbeat(cmd, args)
 		},
 		RunE: CreateHandler,
@@ -1835,6 +2287,7 @@ func NewCLI() *cobra.Command {
 
 	createCmd.Flags().StringP("file", "f", "", "Name of the Modelfile (default \"Modelfile\")")
 	createCmd.Flags().StringP("quantize", "q", "", "Quantize model to this level (e.g. q4_K_M)")
+	createCmd.Flags().String("draft-quantize", "", "Quantize draft model to this level")
 	createCmd.Flags().Bool("experimental", false, "Enable experimental safetensors model creation")
 
 	showCmd := &cobra.Command{
@@ -1877,6 +2330,9 @@ func NewCLI() *cobra.Command {
 	// Image generation flags (width, height, steps, seed, etc.)
 	imagegen.RegisterFlags(runCmd)
 
+	runCmd.Flags().Bool("imagegen", false, "Use the imagegen runner for LLM inference")
+	runCmd.Flags().MarkHidden("imagegen")
+
 	stopCmd := &cobra.Command{
 		Use:     "stop MODEL",
 		Short:   "Stop a running model",
@@ -1888,7 +2344,7 @@ func NewCLI() *cobra.Command {
 	serveCmd := &cobra.Command{
 		Use:     "serve",
 		Aliases: []string{"start"},
-		Short:   "Start ollama",
+		Short:   "Start Ollama",
 		Args:    cobra.ExactArgs(0),
 		RunE:    RunServer,
 	}
@@ -1921,9 +2377,27 @@ func NewCLI() *cobra.Command {
 		RunE:    SigninHandler,
 	}
 
+	loginCmd := &cobra.Command{
+		Use:     "login",
+		Short:   "Sign in to ollama.com",
+		Hidden:  true,
+		Args:    cobra.ExactArgs(0),
+		PreRunE: checkServerHeartbeat,
+		RunE:    SigninHandler,
+	}
+
 	signoutCmd := &cobra.Command{
 		Use:     "signout",
 		Short:   "Sign out from ollama.com",
+		Args:    cobra.ExactArgs(0),
+		PreRunE: checkServerHeartbeat,
+		RunE:    SignoutHandler,
+	}
+
+	logoutCmd := &cobra.Command{
+		Use:     "logout",
+		Short:   "Sign out from ollama.com",
+		Hidden:  true,
 		Args:    cobra.ExactArgs(0),
 		PreRunE: checkServerHeartbeat,
 		RunE:    SignoutHandler,
@@ -1991,7 +2465,7 @@ func NewCLI() *cobra.Command {
 		switch cmd {
 		case runCmd:
 			imagegen.AppendFlagsDocs(cmd)
-			appendEnvDocs(cmd, []envconfig.EnvVar{envVars["OLLAMA_HOST"], envVars["OLLAMA_NOHISTORY"]})
+			appendEnvDocs(cmd, []envconfig.EnvVar{envVars["OLLAMA_EDITOR"], envVars["OLLAMA_HOST"], envVars["OLLAMA_NOHISTORY"]})
 		case serveCmd:
 			appendEnvDocs(cmd, []envconfig.EnvVar{
 				envVars["OLLAMA_DEBUG"],
@@ -1999,9 +2473,11 @@ func NewCLI() *cobra.Command {
 				envVars["OLLAMA_CONTEXT_LENGTH"],
 				envVars["OLLAMA_KEEP_ALIVE"],
 				envVars["OLLAMA_MAX_LOADED_MODELS"],
+				envVars["OLLAMA_MAX_TRANSFER_STREAMS"],
 				envVars["OLLAMA_MAX_QUEUE"],
 				envVars["OLLAMA_MODELS"],
 				envVars["OLLAMA_NUM_PARALLEL"],
+				envVars["OLLAMA_NO_CLOUD"],
 				envVars["OLLAMA_NOPRUNE"],
 				envVars["OLLAMA_ORIGINS"],
 				envVars["OLLAMA_SCHED_SPREAD"],
@@ -2025,13 +2501,15 @@ func NewCLI() *cobra.Command {
 		pullCmd,
 		pushCmd,
 		signinCmd,
+		loginCmd,
 		signoutCmd,
+		logoutCmd,
 		listCmd,
 		psCmd,
 		copyCmd,
 		deleteCmd,
 		runnerCmd,
-		config.LaunchCmd(checkServerHeartbeat),
+		launch.LaunchCmd(checkServerHeartbeat, runInteractiveTUI),
 	)
 
 	return rootCmd

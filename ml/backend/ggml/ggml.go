@@ -50,8 +50,18 @@ var initDevices = sync.OnceFunc(func() {
 	backends = make(map[C.ggml_backend_dev_t]C.ggml_backend_t)
 	for i := range C.ggml_backend_dev_count() {
 		d := C.ggml_backend_dev_get(i)
+		t := C.ggml_backend_dev_type(d)
+		name := C.GoString(C.ggml_backend_dev_name(d))
 
-		switch C.ggml_backend_dev_type(d) {
+		b := C.ggml_backend_dev_init(d, nil)
+		if b == nil {
+			slog.Error("failed to initialize ggml backend device", "device", name, "type", t)
+			panic(fmt.Sprintf("failed to initialize ggml backend device: %s", name))
+		}
+
+		backends[d] = b
+
+		switch t {
 		case C.GGML_BACKEND_DEVICE_TYPE_CPU:
 			if len(cpus) == 0 {
 				// only the first cpu device should be used
@@ -63,8 +73,6 @@ var initDevices = sync.OnceFunc(func() {
 			C.GGML_BACKEND_DEVICE_TYPE_IGPU:
 			gpus = append(gpus, d)
 		}
-
-		backends[d] = C.ggml_backend_dev_init(d, nil)
 	}
 })
 
@@ -378,7 +386,7 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 		}
 	}
 
-	maxGraphNodes := max(1024, len(meta.Tensors().Items())*8)
+	maxGraphNodes := max(1024, len(meta.Tensors().Items())*32)
 
 	sched := C.ggml_backend_sched_new_ext(
 		(*C.ggml_backend_t)(unsafe.Pointer(&schedBackends[0])),
@@ -1069,6 +1077,21 @@ func (t *Tensor) Floats() (data []float32) {
 	return
 }
 
+func (t *Tensor) BackendGet() []float32 {
+	n := int(C.ggml_nelements(t.t))
+	if n == 0 {
+		return nil
+	}
+
+	if t.sync != nil {
+		t.sync()
+	}
+
+	data := make([]float32, n)
+	C.ggml_backend_tensor_get(t.t, unsafe.Pointer(&data[0]), 0, C.ggml_nbytes(t.t))
+	return data
+}
+
 func tensorSet[S ~[]E, E byte | float32 | int32](t *Tensor, s S) {
 	if len(s) == 0 {
 		return
@@ -1313,6 +1336,13 @@ func (t *Tensor) Pad(ctx ml.Context, shape ...int) ml.Tensor {
 	}
 }
 
+func (t *Tensor) PadExt(ctx ml.Context, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3 int) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_pad_ext(ctx.(*Context).ctx, t.t, C.int(lp0), C.int(rp0), C.int(lp1), C.int(rp1), C.int(lp2), C.int(rp2), C.int(lp3), C.int(rp3)),
+	}
+}
+
 // Permute permutes t according to order. Permute panics if the number of dimensions
 // in order does not match the number of dimensions in t.
 func (t *Tensor) Permute(ctx ml.Context, order ...int) ml.Tensor {
@@ -1342,6 +1372,21 @@ func (t *Tensor) SetRows(ctx ml.Context, src ml.Tensor, idxs ml.Tensor) ml.Tenso
 	return &Tensor{
 		b: t.b,
 		t: C.ggml_set_rows(ctx.(*Context).ctx, t.t, src.(*Tensor).t, idxs.(*Tensor).t),
+	}
+}
+
+func (t *Tensor) SetInplace(ctx ml.Context, src ml.Tensor, nb1, nb2, nb3, offset int) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_set_inplace(
+			ctx.(*Context).ctx,
+			t.t,
+			src.(*Tensor).t,
+			C.size_t(nb1),
+			C.size_t(nb2),
+			C.size_t(nb3),
+			C.size_t(offset),
+		),
 	}
 }
 
@@ -1468,6 +1513,13 @@ func (t *Tensor) Sigmoid(ctx ml.Context) ml.Tensor {
 	}
 }
 
+func (t *Tensor) SigmoidOut(ctx ml.Context) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_sigmoid(ctx.(*Context).ctx, t.t),
+	}
+}
+
 func (t *Tensor) View(ctx ml.Context, offset int, shape ...int) ml.Tensor {
 	switch len(shape) {
 	case 1:
@@ -1581,6 +1633,13 @@ func (t *Tensor) GELU(ctx ml.Context, t2 ...ml.Tensor) ml.Tensor {
 	}
 }
 
+func (t *Tensor) GELU_ERF(ctx ml.Context) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_gelu_erf_inplace(ctx.(*Context).ctx, t.t),
+	}
+}
+
 func (t *Tensor) QuickGELU(ctx ml.Context, t2 ...ml.Tensor) ml.Tensor {
 	var tt *C.struct_ggml_tensor
 	if len(t2) > 0 {
@@ -1631,6 +1690,13 @@ func (t *Tensor) Conv2D(ctx ml.Context, t2 ml.Tensor, s0, s1, p0, p1, d0, d1 int
 	}
 }
 
+func (t *Tensor) Conv1DDW(ctx ml.Context, weight ml.Tensor, s, p, d int) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_conv_1d_dw(ctx.(*Context).ctx, weight.(*Tensor).t, t.t, C.int(s), C.int(p), C.int(d)),
+	}
+}
+
 func (t *Tensor) Conv3D(ctx ml.Context, t2 ml.Tensor, c, s0, s1, s2, p0, p1, p2, d0, d1, d2 int) ml.Tensor {
 	var tt ml.Tensor = &Tensor{
 		b: t.b,
@@ -1645,6 +1711,13 @@ func (t *Tensor) SSMConv(ctx ml.Context, kernel ml.Tensor) ml.Tensor {
 	return &Tensor{
 		b: t.b,
 		t: C.ggml_ssm_conv(ctx.(*Context).ctx, t.t, kernel.(*Tensor).t),
+	}
+}
+
+func (t *Tensor) SSMScan(ctx ml.Context, x, dt, A, B, C, ids ml.Tensor) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_ssm_scan(ctx.(*Context).ctx, t.t, x.(*Tensor).t, dt.(*Tensor).t, A.(*Tensor).t, B.(*Tensor).t, C.(*Tensor).t, ids.(*Tensor).t),
 	}
 }
 
@@ -1769,6 +1842,76 @@ func (t *Tensor) Sqrt(ctx ml.Context) ml.Tensor {
 	return &Tensor{
 		b: t.b,
 		t: C.ggml_sqrt(ctx.(*Context).ctx, t.t),
+	}
+}
+
+func (t *Tensor) Exp(ctx ml.Context) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_exp(ctx.(*Context).ctx, t.t),
+	}
+}
+
+func (t *Tensor) Neg(ctx ml.Context) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_neg(ctx.(*Context).ctx, t.t),
+	}
+}
+
+func (t *Tensor) Clamp(ctx ml.Context, min, max float32) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_clamp(ctx.(*Context).ctx, t.t, C.float(min), C.float(max)),
+	}
+}
+
+func (t *Tensor) Softplus(ctx ml.Context) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_softplus(ctx.(*Context).ctx, t.t),
+	}
+}
+
+func (t *Tensor) CumSum(ctx ml.Context) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_cumsum(ctx.(*Context).ctx, t.t),
+	}
+}
+
+func (t *Tensor) Diag(ctx ml.Context) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_diag(ctx.(*Context).ctx, t.t),
+	}
+}
+
+func (t *Tensor) Tri(ctx ml.Context, triType int) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_tri(ctx.(*Context).ctx, t.t, C.enum_ggml_tri_type(triType)),
+	}
+}
+
+func (t *Tensor) Fill(ctx ml.Context, value float32) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_fill_inplace(ctx.(*Context).ctx, t.t, C.float(value)),
+	}
+}
+
+func (t *Tensor) Repeat4D(ctx ml.Context, dim0, dim1, dim2, dim3 int) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_repeat_4d(ctx.(*Context).ctx, t.t, C.int64_t(dim0), C.int64_t(dim1), C.int64_t(dim2), C.int64_t(dim3)),
+	}
+}
+
+func (t *Tensor) SolveTri(ctx ml.Context, b ml.Tensor, lower, left, unitDiag bool) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_solve_tri(ctx.(*Context).ctx, t.t, b.(*Tensor).t, C._Bool(lower), C._Bool(left), C._Bool(unitDiag)),
 	}
 }
 

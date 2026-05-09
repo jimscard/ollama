@@ -71,6 +71,14 @@
     {
       "source": "/api",
       "destination": "/api/introduction"
+    },
+    {
+      "source": "/integrations/clawdbot",
+      "destination": "/integrations/openclaw"
+    },
+    {
+      "source": "/integrations/poolside",
+      "destination": "/integrations/pool"
     }
   ],
   "navigation": {
@@ -101,27 +109,71 @@
           {
             "group": "Integrations",
             "pages": [
-              "/integrations/claude-code",
-              "/integrations/clawdbot",
-              "/integrations/cline",
-              "/integrations/codex",
-              "/integrations/droid",
-              "/integrations/goose",
-              "/integrations/jetbrains",
-              "/integrations/marimo",
-              "/integrations/n8n",
-              "/integrations/onyx",
-              "/integrations/opencode",
-              "/integrations/roo-code",
-              "/integrations/vscode",
-              "/integrations/xcode",
-              "/integrations/zed"
+              "/integrations/index",
+              {
+                "group": "Assistants",
+                "expanded": true,
+                "pages": [
+                  "/integrations/openclaw",
+                  "/integrations/hermes"
+                ]
+              },
+              {
+                "group": "Coding",
+                "expanded": true,
+                "pages": [
+                  "/integrations/claude-code",
+                  "/integrations/codex",
+                  "/integrations/copilot-cli",
+                  "/integrations/opencode",
+                  "/integrations/droid",
+                  "/integrations/goose",
+                  "/integrations/pi",
+                  "/integrations/pool"
+                ]
+              },
+              {
+                "group": "IDEs & Editors",
+                "expanded": true,
+                "pages": [
+                  "/integrations/cline",
+                  "/integrations/jetbrains",
+                  "/integrations/roo-code",
+                  "/integrations/vscode",
+                  "/integrations/xcode",
+                  "/integrations/zed"
+                ]
+              },
+              {
+                "group": "Chat & RAG",
+                "pages": [
+                  "/integrations/onyx"
+                ]
+              },
+              {
+                "group": "Automation",
+                "pages": [
+                  "/integrations/n8n"
+                ]
+              },
+              {
+                "group": "Notebooks",
+                "pages": [
+                  "/integrations/marimo"
+                ]
+              }
             ]
           },
           {
             "group": "More information",
             "pages": [
               "/cli",
+              {
+                "group": "Assistant Sandboxing",
+                "pages": [
+                  "/integrations/nemoclaw"
+                ]
+              },
               "/modelfile",
               "/context-length",
               "/linux",

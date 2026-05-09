@@ -1,5 +1,3 @@
-//go:build mlx
-
 package safetensors
 
 import (
@@ -66,6 +64,8 @@ func dtypeFromString(s string) mlx.Dtype {
 		return mlx.DtypeInt64
 	case "U8", "UINT8":
 		return mlx.DtypeUint8
+	case "F8_E4M3", "F8_E5M2", "F8_E4M3FN", "F8_E5M2FNUZ":
+		return mlx.DtypeUint8 // FP8 types stored as raw uint8 bytes
 	default:
 		return mlx.DtypeFloat32
 	}
@@ -301,6 +301,11 @@ func (mw *ModelWeights) HasTensor(name string) bool {
 // Quantization returns empty string for directory-based weights (not quantized).
 func (mw *ModelWeights) Quantization() string {
 	return ""
+}
+
+// GroupSize returns 0 for directory-based weights (use default).
+func (mw *ModelWeights) GroupSize() int {
+	return 0
 }
 
 // ReleaseAll releases all cached native file handles.

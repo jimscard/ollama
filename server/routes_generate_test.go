@@ -162,6 +162,7 @@ func TestGenerateChatRemote(t *testing.T) {
 }
 
 func TestGenerateChat(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
 	gin.SetMode(gin.TestMode)
 
 	mock := mockRunner{
@@ -186,7 +187,7 @@ func TestGenerateChat(t *testing.T) {
 			getGpuFn:        getGpuFn,
 			getSystemInfoFn: getSystemInfoFn,
 			waitForRecovery: 250 * time.Millisecond,
-			loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
 				// add small delay to simulate loading
 				time.Sleep(time.Millisecond)
 				req.successCh <- &runnerRef{
@@ -878,6 +879,7 @@ func TestGenerateChat(t *testing.T) {
 }
 
 func TestGenerate(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
 	gin.SetMode(gin.TestMode)
 
 	mock := mockRunner{
@@ -902,7 +904,7 @@ func TestGenerate(t *testing.T) {
 			getGpuFn:        getGpuFn,
 			getSystemInfoFn: getSystemInfoFn,
 			waitForRecovery: 250 * time.Millisecond,
-			loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
 				// add small delay to simulate loading
 				time.Sleep(time.Millisecond)
 				req.successCh <- &runnerRef{
@@ -1386,7 +1388,7 @@ func TestGenerateLogprobs(t *testing.T) {
 				getGpuFn:        getGpuFn,
 				getSystemInfoFn: getSystemInfoFn,
 				waitForRecovery: 250 * time.Millisecond,
-				loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
 					req.successCh <- &runnerRef{llama: mock}
 					return false
 				},
@@ -1469,6 +1471,119 @@ func TestGenerateLogprobs(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestGenerateLogprobsWithBuiltinParser(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	mock := mockRunner{}
+	mock.CompletionFn = func(ctx context.Context, r llm.CompletionRequest, fn func(r llm.CompletionResponse)) error {
+		responses := []llm.CompletionResponse{
+			{
+				Content:  "h",
+				Logprobs: []llm.Logprob{{TokenLogprob: llm.TokenLogprob{Token: "h", Logprob: -0.1}}},
+			},
+			{
+				Content:  "i</think>Hello",
+				Logprobs: []llm.Logprob{{TokenLogprob: llm.TokenLogprob{Token: "hi", Logprob: -0.2}}},
+			},
+			{
+				Content:    " world",
+				Done:       true,
+				DoneReason: llm.DoneReasonStop,
+				Logprobs:   []llm.Logprob{{TokenLogprob: llm.TokenLogprob{Token: " world", Logprob: -0.3}}},
+			},
+		}
+
+		for _, resp := range responses {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				fn(resp)
+			}
+		}
+
+		return nil
+	}
+
+	s := Server{
+		sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 1),
+			finishedReqCh:   make(chan *LlmRequest, 1),
+			expiredCh:       make(chan *runnerRef, 1),
+			unloadedCh:      make(chan any, 1),
+			loaded:          make(map[string]*runnerRef),
+			newServerFn:     newMockServer(&mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			waitForRecovery: 250 * time.Millisecond,
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				req.successCh <- &runnerRef{llama: &mock}
+				return false
+			},
+		},
+	}
+
+	go s.sched.Run(t.Context())
+
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(8192),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_down.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_gate.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_up.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_k.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_q.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_v.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+
+	if w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:    "test-generate-logprob-parser",
+		Files:    map[string]string{"file.gguf": digest},
+		Parser:   "deepseek3",
+		Template: `{{ .Prompt }}`,
+		Stream:   &stream,
+	}); w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	noStream := false
+	w := createRequest(t, s.GenerateHandler, api.GenerateRequest{
+		Model:    "test-generate-logprob-parser",
+		Prompt:   "Why is the sky blue?",
+		Stream:   &noStream,
+		Logprobs: true,
+		Options: map[string]any{
+			"temperature": 0,
+		},
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp api.GenerateResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if got := len(resp.Logprobs); got != 3 {
+		t.Fatalf("expected 3 logprob entries, got %d", got)
+	}
 }
 
 func TestChatLogprobs(t *testing.T) {
@@ -1566,7 +1681,7 @@ func TestChatLogprobs(t *testing.T) {
 				getGpuFn:        getGpuFn,
 				getSystemInfoFn: getSystemInfoFn,
 				waitForRecovery: 250 * time.Millisecond,
-				loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
 					req.successCh <- &runnerRef{llama: mock}
 					return false
 				},
@@ -1676,7 +1791,7 @@ func TestChatWithPromptEndingInThinkTag(t *testing.T) {
 				getGpuFn:        getGpuFn,
 				getSystemInfoFn: getSystemInfoFn,
 				waitForRecovery: 250 * time.Millisecond,
-				loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
 					time.Sleep(time.Millisecond)
 					req.successCh <- &runnerRef{llama: mock}
 					return false
@@ -2106,6 +2221,132 @@ func TestChatWithPromptEndingInThinkTag(t *testing.T) {
 	})
 }
 
+// TestChatFormatWithThinkFalse verifies that when a model uses a builtin
+// parser that supports thinking (e.g. gemma4) and the request explicitly
+// disables thinking (think=false), the format constraint is passed to the
+// first and only completion call. Previously, format was deferred for all
+// thinking-capable parsers and only re-applied after an end-of-thinking
+// transition — a transition that never fires when thinking is off. See
+// https://github.com/ollama/ollama/issues/15260.
+func TestChatFormatWithThinkFalse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	mock := &mockRunner{
+		CompletionResponse: llm.CompletionResponse{
+			Done:               true,
+			DoneReason:         llm.DoneReasonStop,
+			PromptEvalCount:    1,
+			PromptEvalDuration: 1,
+			EvalCount:          1,
+			EvalDuration:       1,
+		},
+	}
+
+	s := &Server{
+		sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 1),
+			finishedReqCh:   make(chan *LlmRequest, 1),
+			expiredCh:       make(chan *runnerRef, 1),
+			unloadedCh:      make(chan any, 1),
+			loaded:          make(map[string]*runnerRef),
+			newServerFn:     newMockServer(mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			waitForRecovery: 250 * time.Millisecond,
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				time.Sleep(time.Millisecond)
+				req.successCh <- &runnerRef{llama: mock}
+				return false
+			},
+		},
+	}
+
+	go s.sched.Run(t.Context())
+
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(8192),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_down.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_gate.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_up.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_k.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_q.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_v.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+
+	// Use the gemma4 builtin parser — it reports HasThinkingSupport=true, which
+	// adds CapabilityThinking to the model and previously triggered deferral of
+	// the format even when the user passed think=false.
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:    "test-gemma4-parser",
+		Files:    map[string]string{"file.gguf": digest},
+		Parser:   "gemma4",
+		Template: `{{- range .Messages }}{{ .Role }}: {{ .Content }}{{ end }}`,
+		Stream:   &stream,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create: expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	format := json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}`)
+
+	var (
+		requestsMu sync.Mutex
+		requests   []llm.CompletionRequest
+	)
+	mock.CompletionFn = func(ctx context.Context, r llm.CompletionRequest, fn func(r llm.CompletionResponse)) error {
+		requestsMu.Lock()
+		requests = append(requests, r)
+		requestsMu.Unlock()
+
+		fn(llm.CompletionResponse{
+			Content:            `{"answer":"42"}`,
+			Done:               true,
+			DoneReason:         llm.DoneReasonStop,
+			PromptEvalCount:    1,
+			PromptEvalDuration: 1,
+			EvalCount:          1,
+			EvalDuration:       1,
+		})
+		return nil
+	}
+
+	streamRequest := false
+	think := false
+	w = createRequest(t, s.ChatHandler, api.ChatRequest{
+		Model:    "test-gemma4-parser",
+		Messages: []api.Message{{Role: "user", Content: "Respond in JSON."}},
+		Think:    &api.ThinkValue{Value: think},
+		Stream:   &streamRequest,
+		Format:   format,
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("chat: expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if len(requests) != 1 {
+		t.Fatalf("expected a single completion call, got %d", len(requests))
+	}
+
+	if !bytes.Equal([]byte(format), []byte(requests[0].Format)) {
+		t.Errorf("expected first completion format to match the request format, got %q", string(requests[0].Format))
+	}
+}
+
 func TestGenerateUnload(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2121,7 +2362,7 @@ func TestGenerateUnload(t *testing.T) {
 			newServerFn:     newMockServer(&mockRunner{}),
 			getGpuFn:        getGpuFn,
 			getSystemInfoFn: getSystemInfoFn,
-			loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
 				loadFnCalled = true
 				req.successCh <- &runnerRef{llama: &mockRunner{}}
 				return false
@@ -2223,7 +2464,7 @@ func TestGenerateWithImages(t *testing.T) {
 			getGpuFn:        getGpuFn,
 			getSystemInfoFn: getSystemInfoFn,
 			waitForRecovery: 250 * time.Millisecond,
-			loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
 				time.Sleep(time.Millisecond)
 				req.successCh <- &runnerRef{
 					llama: &mock,
@@ -2355,6 +2596,7 @@ func TestGenerateWithImages(t *testing.T) {
 // TestImageGenerateStreamFalse tests that image generation respects stream=false
 // and returns a single JSON response instead of streaming ndjson.
 func TestImageGenerateStreamFalse(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
 	gin.SetMode(gin.TestMode)
 
 	p := t.TempDir()
@@ -2367,29 +2609,6 @@ func TestImageGenerateStreamFalse(t *testing.T) {
 		fn(llm.CompletionResponse{Step: 3, TotalSteps: 3, Done: true, DoneReason: llm.DoneReasonStop, Image: "base64image"})
 		return nil
 	}
-
-	opts := api.DefaultOptions()
-	s := Server{
-		sched: &Scheduler{
-			pendingReqCh:  make(chan *LlmRequest, 1),
-			finishedReqCh: make(chan *LlmRequest, 1),
-			expiredCh:     make(chan *runnerRef, 1),
-			unloadedCh:    make(chan any, 1),
-			loaded: map[string]*runnerRef{
-				"": {
-					llama:       &mock,
-					Options:     &opts,
-					model:       &Model{Config: model.ConfigV2{Capabilities: []string{"image"}}},
-					numParallel: 1,
-				},
-			},
-			newServerFn:     newMockServer(&mock),
-			getGpuFn:        getGpuFn,
-			getSystemInfoFn: getSystemInfoFn,
-		},
-	}
-
-	go s.sched.Run(t.Context())
 
 	// Create model manifest with image capability
 	n := model.ParseName("test-image")
@@ -2405,6 +2624,35 @@ func TestImageGenerateStreamFalse(t *testing.T) {
 	if err := manifest.WriteManifest(n, configLayer, nil); err != nil {
 		t.Fatal(err)
 	}
+
+	loadedModel, err := GetModel("test-image")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := api.DefaultOptions()
+	s := Server{
+		sched: &Scheduler{
+			pendingReqCh:  make(chan *LlmRequest, 1),
+			finishedReqCh: make(chan *LlmRequest, 1),
+			expiredCh:     make(chan *runnerRef, 1),
+			unloadedCh:    make(chan any, 1),
+			loaded: map[string]*runnerRef{
+				schedulerModelKey(loadedModel): {
+					llama:       &mock,
+					Options:     &opts,
+					model:       loadedModel,
+					isImagegen:  true,
+					numParallel: 1,
+				},
+			},
+			newServerFn:     newMockServer(&mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+		},
+	}
+
+	go s.sched.Run(t.Context())
 
 	streamFalse := false
 	w := createRequest(t, s.GenerateHandler, api.GenerateRequest{
